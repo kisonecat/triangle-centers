@@ -1,0 +1,62 @@
+name: Build & Deploy (Nix → GitHub Pages)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# Only one deploy at a time
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write       # required for actions/deploy-pages
+  id-token: write    # required for OIDC auth with Pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Install Nix (multi-user) on GitHub-hosted Ubuntu runner
+      - name: Install Nix
+        uses: cachix/install-nix-action@v27
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      # Build inside your shell.nix environment
+      - name: Build site with nix-shell + make
+        run: |
+          nix-shell --pure --run "make"
+
+      # Collect site files for Pages
+      # If your build already writes to a directory (e.g. 'dist' or 'public'),
+      # replace the copy below to point at that directory instead.
+      - name: Prepare artifact
+        run: |
+          mkdir -p public
+          cp -v index.html public/
+          # Copy any additional assets your page needs (css/js/images), e.g.:
+          # cp -vr assets public/ || true
+
+      # Upload the website artifact for deployment
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
+

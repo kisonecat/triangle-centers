@@ -2,15 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-emit_trilinears.py  — inlines `where f(a,b,c)=...` from expr or context
-
-Output object example:
-{
-  center: "X(48)",
-  name: "CROSSPOINT OF X(1) AND X(63)",
-  original: "tan B + tan C : :",
-  trilinear: function(a,b,c,A,B,C) { /* helpers */ return (Math.tan(B)+Math.tan(C)); }
-}
+emit_trilinears.py — supports `where f/g/...` definitions, outputs `original`,
+adds commas between objects, and aggressively expands implicit multiplication
+(e.g., bc -> b*c, abc -> a*b*c).
 """
 
 import argparse, json, re, sys
@@ -21,42 +15,37 @@ from typing import List, Tuple, Optional, Dict
 # ----------------------------
 
 ALLOWED_NAMES = {
-    'a','b','c','A','B','C',
-    's','S','R','r','ra','rb','rc',
-    'omega','pi'
+    'a','b','c','A','B','C','s','S','R','r','ra','rb','rc','omega','pi'
 }
 FUNC_MATH = {'sin','cos','tan','sqrt'}
 FUNC_HELPERS = {'sec','csc','cot'}
 
-# Inline “where …” chopping (used after we first extract definitions)
 TAIL_CUT_RE = re.compile(r'(?i)\bwhere\b.*$')
 EQ_SPLIT_RE = re.compile(r'\s=\s')
 
-# Find definitions in expr or context lines (case-insensitive)
-# Accepts variants like "where f(a,b,c) = 1/[...]"
+# Definitions: any name(p1,p2,p3) = RHS, from expr or context
 WHERE_DEF_RE = re.compile(
-    r'(?i)\bwhere\b\s*([A-Za-z][A-Za-z0-9_]*)\s*\(\s*a\s*,\s*b\s*,\s*c\s*\)\s*=\s*(.+)$'
+    r'(?i)\bwhere\b\s*([A-Za-z][A-Za-z0-9_]*)\s*\(\s*([A-Za-z])\s*,\s*([A-Za-z])\s*,\s*([A-Za-z])\s*\)\s*=\s*(.+)$'
 )
-
-# Also accept bare "f(a,b,c) = ..." without the word 'where'
 BARE_DEF_RE = re.compile(
-    r'(?i)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\(\s*a\s*,\s*b\s*,\s*c\s*\)\s*=\s*(.+)$'
+    r'(?i)^\s*([A-Za-z][A-Za-z0-9_]*)\s*\(\s*([A-Za-z])\s*,\s*([A-Za-z])\s*,\s*([A-Za-z])\s*\)\s*=\s*(.+)$'
 )
 
-# Detect function call like f(a,b,c) with any permutation of a,b,c
 CALL_ABC_RE = re.compile(
     r'\b([A-Za-z][A-Za-z0-9_]*)\s*\(\s*([abc])\s*,\s*([abc])\s*,\s*([abc])\s*\)'
 )
 
-# Function stuck to variable: cosB -> cos(B), tan 3A -> tan(3*A), etc.
+# Function words stuck to symbols
 FIX_FUNC_STUCK_RE = re.compile(r'\b(sin|cos|tan|sec|csc|cot)\s*([ABC])\b')
 FIX_FUNC_SIMPLE_FRAC_RE = re.compile(r'\b(sin|cos|tan|sec|csc|cot)\s*([ABC])\s*/\s*([0-9]+)')
 FIX_FUNC_SIMPLE_SCALE_RE = re.compile(r'\b(sin|cos|tan|sec|csc|cot)\s*(\d+)\s*([ABC])')
 
-# Implicit multiplication
-IMPL_MULT_VARS_RE = re.compile(r'(?<![A-Za-z0-9_])([abcABC])\s*([abcABC])')
-IMPL_MULT_NUM_VAR_RE = re.compile(r'(\d)\s*([abcABC(])')
-IMPL_MULT_CLOSE_VAR_RE = re.compile(r'(\))\s*([abcABC(])')
+# Implicit multiplication helpers
+RUN_VARS_RE = re.compile(r'(?<![A-Za-z0-9_])([abcABC]{2,})(?![A-Za-z0-9_])')  # abc -> a*b*c
+IMPL_MULT_VARS_RE = re.compile(r'(?<![A-Za-z0-9_])([abcABC])\s*([abcABC])')    # a b -> a*b
+IMPL_MULT_NUM_VAR_RE = re.compile(r'(\d)\s*([A-Za-z(])')                        # 2a or 2( -> 2*a / 2*(
+IMPL_MULT_CLOSE_VAR_RE = re.compile(r'(\))\s*([A-Za-z(])')                      # )a or )( -> )*a / )*( 
+VAR_LP_RE = re.compile(r'([abcABC])\s*\(')                                      # a( -> a*(
 
 # Powers / braces
 BRACE_SUP_RE = re.compile(r'\^\s*\{([^{}]+)\}')
@@ -75,75 +64,43 @@ def normalize_greek(s: str) -> str:
     s = s.replace('π', 'pi').replace('Π', 'pi')
     s = s.replace('ω', 'omega').replace('Ω', 'omega')
     s = s.replace('−', '-').replace('–', '-').replace('—', '-')
-    s = s.replace('⋅', '*')
-    s = s.replace('’', "'").replace('′', "'")
+    s = s.replace('⋅', '*').replace('’', "'").replace('′', "'")
     return s
 
-def extract_definitions(expr: str, context_lines: List[str]) -> Dict[str, str]:
-    """
-    Find definitions of the form f(a,b,c)=<rhs> in:
-      - inline expr text (possibly after ', where ...')
-      - any context lines
-    Return dict: {'f': '<rhs>'} (rhs kept raw; later normalized)
-    """
-    defs: Dict[str, str] = {}
-
+def extract_definitions(expr: str, context_lines: List[str]) -> Dict[str, Tuple[Tuple[str,str,str], str]]:
+    defs: Dict[str, Tuple[Tuple[str,str,str], str]] = {}
     def _harvest(line: str):
         line = line.strip()
         m = WHERE_DEF_RE.search(line)
         if m:
-            defs[m.group(1)] = m.group(2).strip()
-            return
+            fname, p1, p2, p3, rhs = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
+            defs[fname] = ((p1, p2, p3), rhs.strip()); return
         m2 = BARE_DEF_RE.search(line)
         if m2:
-            defs[m2.group(1)] = m2.group(2).strip()
-
-    if expr:
-        _harvest(expr)
+            fname, p1, p2, p3, rhs = m2.group(1), m2.group(2), m2.group(3), m2.group(4), m2.group(5)
+            defs[fname] = ((p1, p2, p3), rhs.strip())
+    if expr: _harvest(expr)
     for ln in context_lines or []:
-        _harvest(ln)
-
+        if isinstance(ln, str): _harvest(ln)
     return defs
 
-def substitute_call_with_def(first_coord: str, defs: Dict[str, str]) -> str:
-    """
-    If first coordinate contains calls like f(b,c,a) and we have
-    a def for f(a,b,c)=RHS, inline RHS with a->b, b->c, c->a as needed.
-    Only substitutes for function names found in defs.
-    Handles *one or multiple* occurrences if present.
-    """
-
-    if not defs:
-        return first_coord
-
+def substitute_call_with_def(first_coord: str, defs: Dict[str, Tuple[Tuple[str,str,str], str]]) -> str:
+    if not defs: return first_coord
     def subst_once(m):
         fname, x1, x2, x3 = m.groups()
-        if fname not in defs:
-            return m.group(0)  # leave unchanged
-
-        rhs = defs[fname]
-
-        # Token-safe replacement of a,b,c according to (x1,x2,x3)
-        mapping = {'a': x1, 'b': x2, 'c': x3}
-
-        # Replace with word boundaries; do 'a','b','c' separately
-        def repl_symbol(text: str, sym: str, tgt: str) -> str:
-            return re.sub(rf'\b{sym}\b', tgt, text)
-
+        if fname not in defs: return m.group(0)
+        (p1, p2, p3), rhs = defs[fname]
+        mapping = {p1: x1, p2: x2, p3: x3}
         out = rhs
-        out = repl_symbol(out, 'a', mapping['a'])
-        out = repl_symbol(out, 'b', mapping['b'])
-        out = repl_symbol(out, 'c', mapping['c'])
-
+        for formal, actual in mapping.items():
+            out = re.sub(rf'\b{re.escape(formal)}\b', actual, out)
         return f"({out})"
-
-    # Replace all occurrences
     return CALL_ABC_RE.sub(subst_once, first_coord)
 
 def cut_junk(expr: str) -> str:
     expr = expr.strip()
-    expr = TAIL_CUT_RE.sub('', expr)  # remove trailing “where …” after defs extracted
-    expr = EQ_SPLIT_RE.split(expr)[0]  # keep lhs if someone wrote “= …”
+    expr = TAIL_CUT_RE.sub('', expr)
+    expr = EQ_SPLIT_RE.split(expr)[0]
     return expr.strip()
 
 def first_coordinate(expr: str) -> str:
@@ -162,8 +119,7 @@ def normalize_trig_powers(expr: str) -> str:
         fn, power, var, denom = m.group(1), m.group(2), m.group(3), m.group(4)
         arg = var if not denom else f"{var}/{denom}"
         return f"Math.pow({fn}({arg}),{power})"
-    expr = TRIG_POW_BARE_RE.sub(repl_bare, expr)
-    return expr
+    return TRIG_POW_BARE_RE.sub(repl_bare, expr)
 
 def close_powf(expr: str) -> str:
     if "POWF(" not in expr: return expr
@@ -182,17 +138,62 @@ def close_powf(expr: str) -> str:
             out.append(expr[i]); i += 1
     return "".join(out)
 
+# Catch runs of only triangle vars a|b|c (upper/lower), even after digits,
+# but NOT when they're part of longer identifiers (letters/underscore around).
+RUN_VARS_RE = re.compile(r'(?<![A-Za-z_])([abcABC]{2,})(?![A-Za-z0-9_])')
+
+def expand_implicit_multiplication(s: str) -> str:
+    """
+    Iteratively expand implicit multiplication:
+      bc   -> b*c
+      abc  -> a*b*c
+      2a   -> 2*a
+      a(b) -> a*(b)
+      )a   -> )*a
+      2abc -> 2*a*b*c
+      a(bc)-> a*(b*c)
+    Runs multiple passes until no more changes are needed.
+    """
+    def pass_once(text: str) -> str:
+        # 1) Runs like abc -> a*b*c (handles …2abc, (abc), etc.)
+        def _run_repl(m):
+            run = m.group(1)
+            return '*'.join(list(run))
+        text = RUN_VARS_RE.sub(_run_repl, text)
+
+        # 2) Number before name or '(' : 2a -> 2*a ; 2( -> 2*(
+        text = re.sub(r'(\d)\s*([A-Za-z(])', r'\1*\2', text)
+
+        # 3) ')' before name or '(' : )a -> )*a ; )( -> )*(
+        text = re.sub(r'(\))\s*([A-Za-z(])', r'\1*\2', text)
+
+        # 4) var before '(' : a( -> a*(
+        text = re.sub(r'([abcABC])\s*\(', r'\1*(', text)
+
+        # 5) Adjacent single vars separated by spaces (safety): a b -> a*b
+        text = re.sub(r'(?<![A-Za-z0-9_])([abcABC])\s+([abcABC])(?![A-Za-z0-9_])', r'\1*\2', text)
+
+        return text
+
+    prev = None
+    cur = s
+    # Iterate until stable (cap passes to avoid infinite loops)
+    for _ in range(10):
+        prev = cur
+        cur = pass_once(cur)
+        if cur == prev:
+            break
+    return cur
+
 def pretokenize(expr: str) -> str:
     s = normalize_greek(expr)
     s = SQ2PAR_RE.sub(lambda m: '(' if m.group(0) == '[' else ')', s)
-    s = BRACE_SUP_RE.sub(lambda m: f"^{m.group(1)}", s)  # a^{2} -> a^2
+    s = BRACE_SUP_RE.sub(lambda m: f"^{m.group(1)}", s)
     s = BRACES_RE.sub('', s)
     s = normalize_functions(s)
     s = normalize_trig_powers(s)
     s = close_powf(s)
-    s = IMPL_MULT_VARS_RE.sub(r'\1*\2', s)
-    s = IMPL_MULT_NUM_VAR_RE.sub(r'\1*\2', s)
-    s = IMPL_MULT_CLOSE_VAR_RE.sub(r'\1*\2', s)
+    s = expand_implicit_multiplication(s)
     return re.sub(r'\s+', ' ', s).strip()
 
 # ----------------------------
@@ -367,33 +368,21 @@ def emit_js_object(center: str, name: str, original_expr: str, expr_js: str) -> 
 # ----------------------------
 
 def pick_and_compile(expr_items: List[Tuple[str, List[str]]]) -> Tuple[Optional[str], Optional[str]]:
-    """
-    expr_items: list of (expr_string, context_list) for this center
-    Returns (compiled_js_first_coordinate, chosen_original_expr_string)
-    """
     candidates = []
     for raw, ctx in expr_items:
-        if not raw or not raw.strip():
-            continue
+        if not raw or not raw.strip(): continue
 
-        # 1) Gather any function definitions from expr or context
         defs = extract_definitions(raw, ctx)
-
-        # 2) Keep EXACT original expr (verbatim) for output
         original_expr = raw
 
-        # 3) Remove trailing “where …” text for clean parsing
         cut = cut_junk(raw)
         if not cut: continue
 
-        # 4) Take FIRST coordinate
         first = first_coordinate(cut)
         if not first: continue
 
-        # 5) If it uses f(perm), inline from defs
         first_inlined = substitute_call_with_def(first, defs)
 
-        # 6) Normalize & parse
         norm = pretokenize(first_inlined)
         try:
             toks = tokenize(norm)
@@ -413,7 +402,6 @@ def pick_and_compile(expr_items: List[Tuple[str, List[str]]]) -> Tuple[Optional[
     candidates.sort(key=lambda t: t[0])
     for sc, js, ok, orig, _norm in candidates:
         if ok and js: return js, orig
-    # fallback: best normalized string if parsing failed
     _sc, _js, _ok, orig, norm = candidates[0]
     return norm, orig
 
@@ -426,7 +414,6 @@ def main():
     ap.add_argument('json_file')
     args = ap.parse_args()
 
-    # Load, with tolerant encoding fallback
     try:
         with open(args.json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
@@ -438,14 +425,12 @@ def main():
     for entry in data:
         center = (entry.get('center') or '').strip()
         name = (entry.get('name') or '').strip()
-        tri = entry.get('trilinears', [])
+
         expr_items: List[Tuple[str, List[str]]] = []
-        for t in tri:
+        for t in entry.get('trilinears', []):
             if isinstance(t, dict):
                 expr = t.get('expr', '')
-                ctx = t.get('context', []) or []
-                # Normalize context entries to strings
-                ctx = [c for c in ctx if isinstance(c, str)]
+                ctx = [c for c in (t.get('context') or []) if isinstance(c, str)]
                 expr_items.append((expr, ctx))
 
         js_expr, original_expr = pick_and_compile(expr_items)
@@ -453,9 +438,10 @@ def main():
             js_expr = "NaN"
             original_expr = original_expr or ""
 
-        out.append(emit_js_object(center, name, original_expr, js_expr) + ",")
+        # NOTE: append a comma after each object, per your request.
+        out.append(emit_js_object(center, name, original_expr, js_expr) + ',')
+
     out.append(JS_FOOTER)
-    
     sys.stdout.write("\n".join(out))
 
 if __name__ == '__main__':

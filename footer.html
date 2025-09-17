@@ -187,13 +187,17 @@ function draw() {
   // Special points
   computedSpecialPoints = [];
   CENTERS.forEach((sp, i) => {
-    let [x, y, z] = trilinearsFromTriA(sp.trilinear, geom).map(Number);
-    [x, y, z] = normalizeTrilinears(x, y, z);
-    const P = trilinearToXY(x, y, z, A, B, C, a, b, c);
-    computedSpecialPoints.push({ x: P.x, y: P.y, name: sp.name, index: i });
+    try {
+      let [x, y, z] = trilinearsFromTriA(sp.trilinear, geom).map(Number);
+      [x, y, z] = normalizeTrilinears(x, y, z);
+      const P = trilinearToXY(x, y, z, A, B, C, a, b, c);
+      computedSpecialPoints.push({ x: P.x, y: P.y, name: sp.name, index: i });
 
-    // Dot
-    drawSpecialPointDot(P);
+      // Dot
+      drawSpecialPointDot(P);
+    } catch (e) {
+      //console.error(e);
+    }
   });
 
   // Label (only for hovered)

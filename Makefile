@@ -6,3 +6,9 @@ etc.js: etc.json emit-trilinears.py
 
 etc.json: ETC.html find-centers.py
 	python find-centers.py ETC.html > etc.json
+
+ETC.html:
+	curl -O https://faculty.evansville.edu/ck6/encyclopedia/ETC.html
+
+clean:
+	rm etc.js etc.json ETC.html index.html
