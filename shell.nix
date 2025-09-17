@@ -4,6 +4,7 @@ pkgs.mkShell {
   name = "python-bs4-env";
 
   packages = [
+    pkgs.curl
     (pkgs.python312.withPackages (ps: with ps; [
       beautifulsoup4
       lxml           # parser backend for BeautifulSoup (fast & robust)
