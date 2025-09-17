@@ -1,0 +1,322 @@
+
+/* ==============================
+   Canvas + Geometry Engine
+   ============================== */
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// High-DPI crispness
+function resizeCanvasToDisplaySize() {
+  const ratio = window.devicePixelRatio || 1;
+  const { clientWidth, clientHeight } = canvas;
+  if (canvas.width !== clientWidth * ratio || canvas.height !== clientHeight * ratio) {
+    canvas.width = clientWidth * ratio;
+    canvas.height = clientHeight * ratio;
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  }
+}
+function fit() { resizeCanvasToDisplaySize(); draw(); }
+window.addEventListener('resize', fit);
+
+// Initial triangle (non-degenerate placement)
+let A = { x: 180, y: 140 };
+let B = { x: 520, y: 160 };
+let C = { x: 320, y: 420 };
+
+// Dragging
+const DRAG_RADIUS = 10;
+let dragging = null;
+
+// Hover tracking for special points
+let computedSpecialPoints = []; // [{x,y,name,index}]
+let hoverIdx = -1;
+// Use enter/exit hysteresis to prevent flicker:
+const HOVER_IN  = 14;
+const HOVER_OUT = 20;
+
+canvas.addEventListener('pointerdown', (e) => {
+  const p = getMouse(e);
+  if (dist(p, A) <= DRAG_RADIUS + 4) dragging = 'A';
+  else if (dist(p, B) <= DRAG_RADIUS + 4) dragging = 'B';
+  else if (dist(p, C) <= DRAG_RADIUS + 4) dragging = 'C';
+  if (dragging) canvas.setPointerCapture(e.pointerId);
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  const p = getMouse(e);
+
+  if (dragging) {
+    if (dragging === 'A') A = p;
+    else if (dragging === 'B') B = p;
+    else if (dragging === 'C') C = p;
+    draw();
+    return;
+  }
+
+  // Nearest-point hit test
+  const nearest = getNearestSpecial(p);
+
+  if (hoverIdx === -1) {
+    // Not hovering anything; require "enter" radius
+    if (nearest && nearest.d <= HOVER_IN) {
+      hoverIdx = nearest.i;
+      canvas.style.cursor = 'pointer';
+      draw();
+    } else if (canvas.style.cursor !== 'default') {
+      canvas.style.cursor = 'default';
+    }
+  } else {
+    // Already hovering something; keep it until "exit" radius exceeded
+    const current = computedSpecialPoints[hoverIdx];
+    const dCurrent = current ? dist(p, current) : Infinity;
+
+    if (dCurrent > HOVER_OUT) {
+      // Candidate switch?
+      if (nearest && nearest.d <= HOVER_IN) {
+        hoverIdx = nearest.i;
+        canvas.style.cursor = 'pointer';
+      } else {
+        hoverIdx = -1;
+        canvas.style.cursor = 'default';
+      }
+      draw();
+    } else {
+      // Optionally allow switching if a clearly closer target is inside enter radius
+      if (nearest && nearest.i !== hoverIdx && nearest.d + 2 < dCurrent && nearest.d <= HOVER_IN) {
+        hoverIdx = nearest.i;
+        draw();
+      }
+    }
+  }
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  dragging = null;
+  try { canvas.releasePointerCapture(e.pointerId); } catch(_) {}
+});
+
+function getMouse(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function dist(P, Q) { return Math.hypot(P.x - Q.x, P.y - Q.y); }
+
+/* ---- Geometry helpers ---- */
+// side lengths: a = |BC|, b = |CA|, c = |AB|
+function sideLengths(Ap, Bp, Cp) {
+  return { a: dist(Bp, Cp), b: dist(Cp, Ap), c: dist(Ap, Bp) };
+}
+// Angles from sides, at vertices A,B,C
+function anglesFromSides(a, b, c) {
+  const clamp = (t) => Math.max(-1, Math.min(1, t));
+  const A = Math.acos(clamp((b*b + c*c - a*a) / (2 * b * c)));
+  const B = Math.acos(clamp((c*c + a*a - b*b) / (2 * c * a)));
+  const C = Math.acos(clamp((a*a + b*b - c*c) / (2 * a * b)));
+  return { A, B, C };
+}
+
+// Treat near-zero trilinears as 1:1:1
+function normalizeTrilinears(x, y, z, eps = 1e-9) {
+  if (![x, y, z].every(Number.isFinite)) return [1, 1, 1];
+  const m = Math.max(Math.abs(x), Math.abs(y), Math.abs(z));
+  if (m < eps) return [1, 1, 1];
+  return [x / m, y / m, z / m];
+}
+
+function incenterXY(Axy, Bxy, Cxy, a, b, c) {
+  const W = a + b + c;
+  return {
+    x: (a * Axy.x + b * Bxy.x + c * Cxy.x) / W,
+    y: (a * Axy.y + b * Bxy.y + c * Cxy.y) / W,
+  };
+}
+
+// Symmetric trilinears from triA
+function trilinearsFromTriA(triA, g) {
+  const x = triA(g);
+  const y = triA({ a: g.b, b: g.c, c: g.a, A: g.B, B: g.C, C: g.A });
+  const z = triA({ a: g.c, b: g.a, c: g.b, A: g.C, B: g.A, C: g.B });
+  return [x, y, z];
+}
+
+// Convert trilinears (x:y:z) to Cartesian via barycentrics (a x : b y : c z)
+function trilinearToXY(x, y, z, Axy, Bxy, Cxy, a, b, c) {
+  const wA = a * x, wB = b * y, wC = c * z;
+  const W = wA + wB + wC;
+  if (!isFinite(W) || Math.abs(W) < 1e-12) {
+    return incenterXY(A, B, C, a, b, c);
+  }
+  return {
+    x: (wA * Axy.x + wB * Bxy.x + wC * Cxy.x) / W,
+    y: (wA * Axy.y + wB * Bxy.y + wC * Cxy.y) / W,
+  };
+}
+
+/* ---- Drawing ---- */
+function draw() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+
+  // Triangle fill & stroke
+  ctx.beginPath();
+  ctx.moveTo(A.x, A.y);
+  ctx.lineTo(B.x, B.y);
+  ctx.lineTo(C.x, C.y);
+  ctx.closePath();
+  ctx.fillStyle = '#f5faff';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#1f6feb';
+  ctx.stroke();
+
+  // Edge labels (a, b, c)
+  drawEdgeLabel(B, C, 'a');
+  drawEdgeLabel(C, A, 'b');
+  drawEdgeLabel(A, B, 'c');
+
+  // Vertices
+  drawVertex(A, 'A');
+  drawVertex(B, 'B');
+  drawVertex(C, 'C');
+
+  // Geometry pack
+  const { a, b, c } = sideLengths(A, B, C);
+  const { A: AA, B: BB, C: CC } = anglesFromSides(a, b, c);
+  const geom = { a, b, c, A: AA, B: BB, C: CC };
+
+  // Special points
+  computedSpecialPoints = [];
+  CENTERS.forEach((sp, i) => {
+    let [x, y, z] = trilinearsFromTriA(sp.trilinear, geom).map(Number);
+    [x, y, z] = normalizeTrilinears(x, y, z);
+    const P = trilinearToXY(x, y, z, A, B, C, a, b, c);
+    computedSpecialPoints.push({ x: P.x, y: P.y, name: sp.name, index: i });
+
+    // Dot
+    drawSpecialPointDot(P);
+  });
+
+  // Label (only for hovered)
+  if (hoverIdx >= 0 && computedSpecialPoints[hoverIdx]) {
+    const sp = computedSpecialPoints[hoverIdx];
+    drawSpecialPointLabel(sp, { w, h });
+  }
+}
+
+function drawVertex(P, label) {
+  ctx.beginPath();
+  ctx.arc(P.x, P.y, DRAG_RADIUS, 0, Math.PI * 2);
+  ctx.fillStyle = '#2f81f7';
+  ctx.fill();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#1b4f99';
+  ctx.stroke();
+
+  ctx.font = '600 14px system-ui, Segoe UI, Roboto, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.fillStyle = '#0b1f36';
+  ctx.fillText(label, P.x + 10, P.y + 10);
+}
+
+function drawEdgeLabel(P, Q, label) {
+  const mid = { x: (P.x + Q.x) / 2, y: (P.y + Q.y) / 2 };
+  ctx.save();
+  ctx.font = '12px system-ui, Segoe UI, Roboto, sans-serif';
+  ctx.fillStyle = '#555';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, mid.x, mid.y);
+  ctx.restore();
+}
+
+function drawSpecialPointDot(P) {
+  ctx.beginPath();
+  ctx.arc(P.x, P.y, 4.5, 0, Math.PI * 2);
+  ctx.fillStyle = '#111';
+  ctx.fill();
+}
+
+function drawSpecialPointLabel(sp, bounds) {
+  const name = sp.name || '';
+  if (!name) return;
+
+  // Text metrics
+  ctx.font = '12.5px system-ui, Segoe UI, Roboto, sans-serif';
+  const padX = 6, padY = 4, radius = 6;
+
+  const metrics = ctx.measureText(name);
+  const textW = metrics.width;
+  const textH = 14; // approximate line height
+
+  // Choose a quadrant that keeps the bubble on-screen
+  const offsets = [
+    { dx: 12, dy: -10 },   // right-up
+    { dx: 12, dy:  18 },   // right-down
+    { dx: -(textW + 18), dy: -10 }, // left-up
+    { dx: -(textW + 18), dy: 18 },  // left-down
+  ];
+  let anchor = { dx: 12, dy: -10 }; // default
+  for (const off of offsets) {
+    const bx = sp.x + off.dx, by = sp.y + off.dy;
+    const rw = textW + 2*padX, rh = textH + 2*padY;
+    if (bx >= 4 && by - rh >= 4 && bx + rw <= bounds.w - 4 && by <= bounds.h - 4) {
+      anchor = off; break;
+    }
+  }
+
+  const bx = sp.x + anchor.dx;
+  const by = sp.y + anchor.dy;
+  const rw = textW + 2*padX;
+  const rh = textH + 2*padY;
+
+  // Leader line
+  ctx.beginPath();
+  ctx.moveTo(sp.x, sp.y);
+  ctx.lineTo(bx, by - rh/2);
+  ctx.strokeStyle = 'rgba(0,0,0,0.25)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Bubble background (rounded rect)
+  roundRect(ctx, bx, by - rh, rw, rh, radius);
+  ctx.fillStyle = 'rgba(255,255,255,0.95)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.12)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Text
+  ctx.fillStyle = '#111';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillText(name, bx + padX, by - padY);
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
+// Return nearest special point (index & distance) to mouse p
+function getNearestSpecial(p) {
+  if (!computedSpecialPoints.length) return null;
+  let bestI = -1, bestD = Infinity;
+  for (let i = 0; i < computedSpecialPoints.length; i++) {
+    const d = dist(p, computedSpecialPoints[i]);
+    if (d < bestD) { bestD = d; bestI = i; }
+  }
+  return bestI >= 0 ? { i: bestI, d: bestD } : null;
+}
+
+// Start
+fit();
+draw();
+</script>
+</body>
+</html>
+
